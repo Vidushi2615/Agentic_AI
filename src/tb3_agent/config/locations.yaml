@@ -1,0 +1,34 @@
+spawn:
+  x: -2.0
+  y: -0.5
+  yaw: 0.0
+
+north_west_room:
+  x: 1.8
+  y: 4.2
+  yaw: 0.0
+
+north_center_room:
+  x: 5.8
+  y: 4.0
+  yaw: 0.0
+
+north_east_room:
+  x: 10.8
+  y: 4.0
+  yaw: 0.0
+
+hallway_center:
+  x: 5.8
+  y: 0.0
+  yaw: 0.0
+
+south_west_room:
+  x: 0.5
+  y: -0.8
+  yaw: 0.0
+
+south_east_room:
+  x: 11.8
+  y: -1.8
+  yaw: 0.0

@@ -7,18 +7,25 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 
+HOUSE_MAP = '/home/vidushi/ros2_ws/maps/map_house.yaml'
+INITIAL_POSE = (
+    '{header: {frame_id: map}, pose: {pose: {position: {x: -2.0, y: -0.5, z: 0.0}, '
+    'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}, covariance: [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, '
+    '0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '
+    '0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]}}'
+)
+
+
 def generate_launch_description() -> LaunchDescription:
-    initial_pose = (
-        '{header: {frame_id: map}, pose: {pose: {position: {x: -2.0, y: -0.5, z: 0.0}, '
-        'orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}, covariance: [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, '
-        '0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '
-        '0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]}}'
-    )
-    package_share = get_package_share_directory('tb3_topic_nav')
+    package_share = get_package_share_directory('tb3_bringup')
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('turtlebot3_gazebo'), 'launch', 'turtlebot3_world.launch.py')
+            os.path.join(
+                get_package_share_directory('turtlebot3_gazebo'),
+                'launch',
+                'turtlebot3_house.launch.py',
+            )
         )
     )
 
@@ -27,20 +34,12 @@ def generate_launch_description() -> LaunchDescription:
             os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'bringup_launch.py')
         ),
         launch_arguments={
-            'map': os.path.join(get_package_share_directory('turtlebot3_navigation2'), 'map', 'map.yaml'),
+            'map': HOUSE_MAP,
             'use_sim_time': 'true',
             'autostart': 'true',
             'use_composition': 'False',
             'params_file': os.path.join(package_share, 'config', 'nav2_burger.yaml'),
         }.items(),
-    )
-
-    navigator = Node(
-        package='tb3_topic_nav',
-        executable='goal_pose_navigator',
-        name='goal_pose_navigator',
-        output='screen',
-        parameters=[{'use_sim_time': True}],
     )
 
     publish_initial_pose = TimerAction(
@@ -54,11 +53,20 @@ def generate_launch_description() -> LaunchDescription:
                     '--once',
                     '/initialpose',
                     'geometry_msgs/msg/PoseWithCovarianceStamped',
-                    initial_pose,
+                    INITIAL_POSE,
                 ],
                 output='screen',
             )
         ],
     )
 
-    return LaunchDescription([gazebo, nav2, navigator, publish_initial_pose])
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='house_nav_debug_rviz',
+        arguments=['-d', os.path.join(package_share, 'rviz', 'house_nav_debug.rviz')],
+        parameters=[{'use_sim_time': True}],
+        output='screen',
+    )
+
+    return LaunchDescription([gazebo, nav2, publish_initial_pose, rviz])
