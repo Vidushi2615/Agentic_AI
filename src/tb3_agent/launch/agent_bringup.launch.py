@@ -26,4 +26,12 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{'use_sim_time': True}],
     )
 
-    return LaunchDescription([bringup, executor])
+    task_agent = Node(
+        package='tb3_agent',
+        executable='task_agent_node',
+        name='task_agent_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}],
+    )
+
+    return LaunchDescription([bringup, task_agent, executor])

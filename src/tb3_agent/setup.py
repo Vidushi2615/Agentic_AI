@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'command_executor_node = tb3_agent.command_executor_node:main',
+            'task_agent_node = tb3_agent.task_agent_node:main',
         ],
     },
 )
