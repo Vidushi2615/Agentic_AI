@@ -26,12 +26,14 @@ class CommandExecutorNode(Node):
         self.locations = self._load_locations(locations_file)
         self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self.goal_marker_publisher = self.create_publisher(Marker, '/agent_goal_marker', 10)
+        self.status_publisher = self.create_publisher(String, '/agent_status', 10)
         self.pending_goal = None
         self.goal_handle = None
         self.goal_in_progress = False
 
         self.create_subscription(String, '/agent_command', self._command_callback, 10)
         self.create_timer(1.0, self._try_send_pending_goal)
+        self._publish_status('idle')
         self.get_logger().info('Listening for JSON commands on /agent_command')
 
     def _load_locations(self, locations_file: str) -> dict:
@@ -89,6 +91,7 @@ class CommandExecutorNode(Node):
 
         self.pending_goal = pose
         self._publish_goal_marker(pose)
+        self._publish_status(f'queued x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}')
         self.get_logger().info(f'Queued navigation goal x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}')
         self._try_send_pending_goal()
 
@@ -96,25 +99,31 @@ class CommandExecutorNode(Node):
         self.pending_goal = None
         self._delete_goal_marker()
         if self.goal_handle is None:
+            self._publish_status('idle')
             self.get_logger().info('No active goal to cancel.')
             return
         cancel_future = self.goal_handle.cancel_goal_async()
         cancel_future.add_done_callback(self._cancel_done_callback)
+        self._publish_status('cancelling')
         self.get_logger().info('Requested goal cancellation.')
 
     def _handle_status(self) -> None:
         if self.goal_in_progress:
+            self._publish_status('goal active')
             self.get_logger().info('Navigation status: goal active.')
             return
         if self.pending_goal is not None:
+            self._publish_status('goal queued, waiting for Nav2')
             self.get_logger().info('Navigation status: goal queued, waiting for Nav2.')
             return
+        self._publish_status('idle')
         self.get_logger().info('Navigation status: idle.')
 
     def _try_send_pending_goal(self) -> None:
         if self.pending_goal is None or self.goal_in_progress:
             return
         if not self.nav_client.wait_for_server(timeout_sec=0.1):
+            self._publish_status('waiting for Nav2 action server')
             self.get_logger().info('Nav2 action server not ready yet')
             return
 
@@ -123,6 +132,7 @@ class CommandExecutorNode(Node):
         self.goal_in_progress = True
         send_goal_future = self.nav_client.send_goal_async(goal)
         send_goal_future.add_done_callback(self._goal_response_callback)
+        self._publish_status('goal sent to Nav2')
         self.get_logger().info('Goal sent to Nav2')
 
     def _goal_response_callback(self, future) -> None:
@@ -130,16 +140,19 @@ class CommandExecutorNode(Node):
             goal_handle = future.result()
         except Exception as exc:
             self.goal_in_progress = False
+            self._publish_status(f'failed to send goal: {exc}')
             self.get_logger().warning(f'Failed to send goal: {exc}')
             return
 
         if goal_handle is None or not goal_handle.accepted:
             self.goal_in_progress = False
+            self._publish_status('goal rejected')
             self.get_logger().warning('Goal rejected')
             return
 
         self.goal_handle = goal_handle
         self.pending_goal = None
+        self._publish_status('goal accepted')
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._goal_result_callback)
 
@@ -148,8 +161,10 @@ class CommandExecutorNode(Node):
         self.goal_handle = None
         try:
             result = future.result()
+            self._publish_status(f'navigation finished with status code {result.status}')
             self.get_logger().info(f'Navigation finished with status code {result.status}')
         except Exception as exc:
+            self._publish_status(f'navigation failed: {exc}')
             self.get_logger().warning(f'Navigation failed: {exc}')
 
     def _cancel_done_callback(self, future) -> None:
@@ -157,10 +172,13 @@ class CommandExecutorNode(Node):
             future.result()
             self.get_logger().info('Cancel request completed.')
         except Exception as exc:
+            self._publish_status(f'cancel request failed: {exc}')
             self.get_logger().warning(f'Cancel request failed: {exc}')
         finally:
             self.goal_in_progress = False
             self.goal_handle = None
+            if self.pending_goal is None:
+                self._publish_status('idle')
 
     def _publish_goal_marker(self, pose: PoseStamped) -> None:
         marker = Marker()
@@ -188,6 +206,11 @@ class CommandExecutorNode(Node):
         marker.id = 0
         marker.action = Marker.DELETE
         self.goal_marker_publisher.publish(marker)
+
+    def _publish_status(self, status: str) -> None:
+        status_msg = String()
+        status_msg.data = status
+        self.status_publisher.publish(status_msg)
 
 
 def main() -> None:

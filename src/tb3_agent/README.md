@@ -2,6 +2,40 @@
 
 ROS 2 package for agent-side command execution on TurtleBot3.
 
+## Bedrock setup
+
+Install `boto3` into the Python environment used by your ROS 2 workspace:
+
+```bash
+python3 -m pip install boto3
+```
+
+Export the Bedrock configuration before launching:
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=your_bedrock_api_key
+export BEDROCK_MODEL_ID=your_claude_sonnet_4_6_model_id
+export AWS_DEFAULT_REGION=eu-west-2
+```
+
+You can also store them in a workspace-level `.env` file so you do not need
+to export them in every terminal. The planner automatically reads
+`/home/vidushi/ros2_ws/.env` if it exists.
+
+Example:
+
+```bash
+cp /home/vidushi/ros2_ws/src/tb3_agent/config/bedrock.env.example /home/vidushi/ros2_ws/.env
+```
+
+Then edit `/home/vidushi/ros2_ws/.env`:
+
+```bash
+AWS_BEARER_TOKEN_BEDROCK=your_bedrock_api_key
+BEDROCK_MODEL_ID=anthropic.claude-sonnet-4-6
+AWS_DEFAULT_REGION=eu-west-2
+```
+
 ## Run
 
 ```bash
@@ -17,8 +51,8 @@ and opens the house navigation RViz debug view.
 ## Task topic
 
 The task agent subscribes to `std_msgs/msg/String` on `/task_request`.
-Write natural-language requests there and it converts them into structured
-JSON commands on `/agent_command` for the executor.
+Write natural-language requests there and the Bedrock planner converts them
+into safe tool calls and structured JSON commands on `/agent_command`.
 
 Examples:
 
@@ -32,6 +66,14 @@ ros2 topic pub --once /task_request std_msgs/msg/String '{data: "navigate to x 5
 
 ```bash
 ros2 topic pub --once /task_request std_msgs/msg/String '{data: "cancel"}'
+```
+
+```bash
+ros2 topic pub --once /task_request std_msgs/msg/String '{data: "what is the robot doing?"}'
+```
+
+```bash
+ros2 topic pub --once /task_request std_msgs/msg/String '{data: "where can you go?"}'
 ```
 
 ## Command topic
@@ -58,5 +100,8 @@ ros2 topic pub --once /agent_command std_msgs/msg/String '{data: "{\"action\":\"
 The executor publishes the currently commanded goal marker to
 `/agent_goal_marker` as `visualization_msgs/msg/Marker` for RViz.
 
-The task agent publishes parsing feedback to `/agent_feedback`
+The task agent publishes Bedrock feedback to `/agent_feedback`
 as `std_msgs/msg/String`.
+
+The executor publishes its latest navigation state on `/agent_status`
+as `std_msgs/msg/String` for the planner.
