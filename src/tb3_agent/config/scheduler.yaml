@@ -1,0 +1,15 @@
+site:
+  latitude: 37.7749
+  longitude: -122.4194
+  timezone: America/Los_Angeles
+
+region: eu-west-2
+weather_poll_seconds: 300
+schedule_poll_seconds: 5
+forecast_lookahead_hours: 1
+resume_unfinished_missions_on_startup: false
+state_file: .tb3_scheduler_state.json
+
+robots:
+  - name: robot_1
+    home_location: spawn

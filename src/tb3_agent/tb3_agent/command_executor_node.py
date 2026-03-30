@@ -25,16 +25,16 @@ class CommandExecutorNode(Node):
         locations_file = os.path.join(get_package_share_directory('tb3_agent'), 'config', 'locations.yaml')
         self.locations = self._load_locations(locations_file)
         self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-        self.goal_marker_publisher = self.create_publisher(Marker, '/agent_goal_marker', 10)
-        self.status_publisher = self.create_publisher(String, '/agent_status', 10)
+        self.goal_marker_publisher = self.create_publisher(Marker, 'agent_goal_marker', 10)
+        self.status_publisher = self.create_publisher(String, 'agent_status', 10)
         self.pending_goal = None
         self.goal_handle = None
         self.goal_in_progress = False
 
-        self.create_subscription(String, '/agent_command', self._command_callback, 10)
+        self.create_subscription(String, 'agent_command', self._command_callback, 10)
         self.create_timer(1.0, self._try_send_pending_goal)
         self._publish_status('idle')
-        self.get_logger().info('Listening for JSON commands on /agent_command')
+        self.get_logger().info('Listening for JSON commands on agent_command')
 
     def _load_locations(self, locations_file: str) -> dict:
         with open(locations_file, 'r', encoding='utf-8') as handle:

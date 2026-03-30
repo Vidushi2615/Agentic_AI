@@ -13,7 +13,13 @@ setup(
         ('share/' + package_name, ['package.xml', 'README.md']),
         (
             'share/' + package_name + '/config',
-            ['config/locations.yaml', 'config/agent_system_prompt.txt', 'config/bedrock.env.example'],
+            [
+                'config/locations.yaml',
+                'config/agent_system_prompt.txt',
+                'config/bedrock.env.example',
+                'config/scheduler.yaml',
+                'config/scheduler_system_prompt.txt',
+            ],
         ),
         ('share/' + package_name + '/launch', ['launch/agent_bringup.launch.py']),
     ],
@@ -28,6 +34,7 @@ setup(
         'console_scripts': [
             'command_executor_node = tb3_agent.command_executor_node:main',
             'task_agent_node = tb3_agent.task_agent_node:main',
+            'scheduler_agent_node = tb3_agent.scheduler_agent_node:main',
         ],
     },
 )

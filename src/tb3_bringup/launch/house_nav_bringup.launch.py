@@ -18,6 +18,7 @@ INITIAL_POSE = (
 
 def generate_launch_description() -> LaunchDescription:
     package_share = get_package_share_directory('tb3_bringup')
+    turtlebot3_nav2_share = get_package_share_directory('turtlebot3_navigation2')
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -38,7 +39,7 @@ def generate_launch_description() -> LaunchDescription:
             'use_sim_time': 'true',
             'autostart': 'true',
             'use_composition': 'False',
-            'params_file': os.path.join(package_share, 'config', 'nav2_burger.yaml'),
+            'params_file': os.path.join(turtlebot3_nav2_share, 'param', 'humble', 'burger.yaml'),
         }.items(),
     )
 

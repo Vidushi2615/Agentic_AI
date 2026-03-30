@@ -199,7 +199,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /agent_goal_marker
+        Value: /robot_1/agent_goal_marker
       Value: true
     - Class: rviz_common/Group
       Displays:

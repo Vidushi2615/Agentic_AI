@@ -23,5 +23,6 @@ rosbag2_*/
 *.yml.local
 *.json.local
 *.toml.local
+.tb3_scheduler_state.json
 
 aws/dist/
