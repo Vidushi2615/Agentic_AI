@@ -15,6 +15,7 @@
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>turtlebot3_gazebo</exec_depend>
+  <exec_depend>turtlebot3_navigation2</exec_depend>
   <exec_depend>xacro</exec_depend>
 
   <export>

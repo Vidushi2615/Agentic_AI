@@ -4,19 +4,16 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ament_index_python.packages import get_package_share_directory
-from zoneinfo import ZoneInfo
 
 try:
     import boto3
     from botocore.config import Config
-    from botocore.exceptions import BotoCoreError, ClientError
 except ImportError:  # pragma: no cover - handled at runtime
     boto3 = None
     Config = None
-    BotoCoreError = Exception
-    ClientError = Exception
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -45,6 +42,14 @@ STOP_CONTROL_COMMANDS = {
 }
 URGENT_PRIORITY = 'urgent'
 NORMAL_PRIORITY = 'normal'
+URGENT_KEYWORDS = {
+    'urgent',
+    'urgently',
+    'immediately',
+    'emergency',
+    'high priority',
+    'asap',
+}
 
 
 class SchedulerAgentNode(Node):
@@ -77,8 +82,7 @@ class SchedulerAgentNode(Node):
         }
         self.mission_state: dict[str, Any] = self._load_state()
         self.weather_snapshot: dict[str, Any] | None = self.mission_state.get('weather') or None
-        self.weather_block_reason = ''
-        self.daylight_block_reason = ''
+        self.last_scheduler_block_reason = ''
 
         self.status_publisher = self.create_publisher(String, '/scheduler/status', 10)
         self.feedback_publisher = self.create_publisher(String, '/scheduler/feedback', 10)
@@ -104,6 +108,7 @@ class SchedulerAgentNode(Node):
         self.create_timer(float(self.scheduler_config['schedule_poll_seconds']), self._scheduler_tick)
         self._publish_feedback('Scheduler agent started.')
         self._refresh_weather()
+        self._drop_unrequested_return_home_subtasks_from_state()
         if not self.scheduler_config.get('resume_unfinished_missions_on_startup', False):
             self._pause_restored_missions()
         self._publish_configuration_warning()
@@ -163,13 +168,30 @@ class SchedulerAgentNode(Node):
         with open(self.state_path, 'w', encoding='utf-8') as handle:
             json.dump(self.mission_state, handle, indent=2)
 
+    def _drop_unrequested_return_home_subtasks_from_state(self) -> None:
+        changed = False
+        for mission_id in self.mission_state.get('mission_order', []):
+            mission = self.mission_state['missions'][mission_id]
+            retained_subtasks = []
+            for subtask in mission.get('subtasks', []):
+                if self._should_drop_unrequested_return_home_subtask(mission, subtask):
+                    changed = True
+                    self._publish_feedback(
+                        f"Removed stale unrequested return-to-spawn subtask from urgent mission {mission_id}."
+                    )
+                    continue
+                retained_subtasks.append(subtask)
+            mission['subtasks'] = retained_subtasks
+        if changed:
+            self._save_state()
+
     def _mission_request_callback(self, msg: String) -> None:
         request_text = msg.data.strip()
         if not request_text:
             return
-        if self._handle_control_text(request_text):
-            return
         parsed = self._parse_mission_request(request_text)
+        if self._handle_control_text(parsed['request_text']):
+            return
         self._enqueue_mission(
             parsed['request_text'],
             None,
@@ -256,7 +278,7 @@ class SchedulerAgentNode(Node):
         try:
             parsed = json.loads(request_text)
         except json.JSONDecodeError:
-            return {'request_text': request_text, 'priority': NORMAL_PRIORITY}
+            return {'request_text': request_text, 'priority': self._infer_priority(request_text)}
 
         if not isinstance(parsed, dict):
             return {'request_text': request_text, 'priority': NORMAL_PRIORITY}
@@ -276,6 +298,14 @@ class SchedulerAgentNode(Node):
             'preferred_robot': preferred_robot,
         }
 
+    @staticmethod
+    def _infer_priority(text: str) -> str:
+        normalized = text.lower()
+        for keyword in URGENT_KEYWORDS:
+            if keyword in normalized:
+                return URGENT_PRIORITY
+        return NORMAL_PRIORITY
+
     def _preempt_robot_for_urgent_mission(self, robot_name: str, urgent_mission_id: str) -> None:
         robot_state = self.robot_states[robot_name]
         mission_id = robot_state['active_mission_id']
@@ -286,12 +316,24 @@ class SchedulerAgentNode(Node):
         current_mission = self.mission_state['missions'].get(mission_id)
         if current_mission is None or mission_id == urgent_mission_id:
             return
+        if (
+            current_mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY
+            and self._mission_order_index(current_mission['mission_id']) > self._mission_order_index(urgent_mission_id)
+        ):
+            return
 
+        matched_active_subtask = False
         for subtask in current_mission.get('subtasks', []):
             if subtask.get('subtask_id') == subtask_id:
                 subtask['status'] = 'paused'
                 subtask['last_message'] = f'Preempted by urgent mission {urgent_mission_id}.'
+                matched_active_subtask = True
                 break
+        if not matched_active_subtask:
+            for subtask in current_mission.get('subtasks', []):
+                if subtask.get('status') == 'dispatched':
+                    subtask['status'] = 'paused'
+                    subtask['last_message'] = f'Preempted by urgent mission {urgent_mission_id}.'
         current_mission['status'] = 'paused'
         current_mission['pause_reason'] = f'preempted_by_{urgent_mission_id}'
 
@@ -306,6 +348,8 @@ class SchedulerAgentNode(Node):
         }
         self.robot_task_publishers[robot_name].publish(String(data=json.dumps(control_envelope)))
         robot_state['control_in_progress'] = True
+        robot_state['active_mission_id'] = mission_id
+        robot_state['active_subtask_id'] = control_envelope['subtask_id']
         self._save_state()
         self._publish_feedback(
             f'Preempting {mission_id}/{subtask_id} on {robot_name} for urgent mission {urgent_mission_id}.'
@@ -346,22 +390,49 @@ class SchedulerAgentNode(Node):
         return _callback
 
     def _handle_task_result(self, robot_name: str, result: dict) -> None:
-        mission_id = result.get('mission_id')
-        subtask_id = result.get('subtask_id')
+        mission_id = str(result.get('mission_id', ''))
+        subtask_id = str(result.get('subtask_id', ''))
+        robot_state = self.robot_states[robot_name]
+        active_matches = (
+            robot_state.get('active_mission_id') == mission_id
+            and robot_state.get('active_subtask_id') == subtask_id
+        )
         mission = self.mission_state['missions'].get(mission_id)
         if mission is None:
+            if active_matches:
+                self._clear_robot_assignment(robot_name)
+            self._publish_feedback(
+                f"{robot_name} reported result for non-mission task {mission_id}/{subtask_id}: "
+                f"{result.get('status', 'unknown')} - {result.get('message', '')}"
+            )
             return
+
         matched_subtask = False
         for subtask in mission['subtasks']:
             if subtask['subtask_id'] != subtask_id:
                 continue
             matched_subtask = True
+            if not active_matches and subtask.get('status') != 'dispatched':
+                subtask['last_message'] = f"Stale result ignored: {result.get('message', '')}"
+                self._publish_feedback(
+                    f"Ignored stale result for {mission_id}/{subtask_id} on {robot_name}: "
+                    f"{result.get('status', 'unknown')} - {result.get('message', '')}"
+                )
+                self._save_state()
+                return
             subtask['last_message'] = result.get('message', '')
             status = result.get('status', 'failed')
             if status == 'completed':
                 subtask['status'] = 'completed'
+                subtask['completed_outcome_tags'] = self._normalize_tags(
+                    result.get('completed_outcome_tags', [])
+                )
+                subtask['completion_summary'] = result.get('completion_summary', result.get('message', ''))
             elif status == 'cancelled':
                 subtask['status'] = 'paused'
+                if not str(mission.get('pause_reason', '')).startswith('preempted_by_'):
+                    mission['status'] = 'paused'
+                    mission['pause_reason'] = 'cancelled'
             elif status == 'needs_clarification':
                 subtask['status'] = 'needs_clarification'
                 mission['status'] = 'paused'
@@ -371,18 +442,30 @@ class SchedulerAgentNode(Node):
                 mission['status'] = 'paused'
                 mission['pause_reason'] = status
 
+        if matched_subtask:
+            has_dispatched_subtask = any(
+                subtask.get('status') == 'dispatched' for subtask in mission.get('subtasks', [])
+            )
+            if not has_dispatched_subtask and mission.get('status') == 'executing':
+                mission['status'] = 'planned'
+
         if not matched_subtask:
             self._publish_feedback(
                 f"{robot_name} completed control task {mission_id}/{subtask_id}: {result.get('message', '')}"
             )
 
-        self.robot_states[robot_name]['active_mission_id'] = None
-        self.robot_states[robot_name]['active_subtask_id'] = None
-        self.robot_states[robot_name]['control_in_progress'] = False
+        if active_matches:
+            self._clear_robot_assignment(robot_name)
+        else:
+            self._publish_feedback(
+                f"Received non-active result for {mission_id}/{subtask_id}; current active task remains unchanged."
+            )
 
         if mission['subtasks'] and all(subtask['status'] == 'completed' for subtask in mission['subtasks']):
             mission['status'] = 'completed'
             mission['pause_reason'] = ''
+            if mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY:
+                self._apply_completed_outcomes_to_pending_work(mission)
         elif matched_subtask and mission['status'] not in {'paused', 'completed'}:
             mission['status'] = 'planned'
         self._save_state()
@@ -390,14 +473,23 @@ class SchedulerAgentNode(Node):
             f"{robot_name} reported {result.get('status')} for {mission_id}/{subtask_id}: {result.get('message', '')}"
         )
 
+    def _clear_robot_assignment(self, robot_name: str) -> None:
+        self.robot_states[robot_name]['active_mission_id'] = None
+        self.robot_states[robot_name]['active_subtask_id'] = None
+        self.robot_states[robot_name]['control_in_progress'] = False
+
     def _scheduler_tick(self) -> None:
         self._publish_status()
         allowed, reason = self._work_allowed()
         if not allowed:
+            self._publish_blocked_if_needed(reason)
             self._pause_active_work(reason)
             return
+        self.last_scheduler_block_reason = ''
 
-        for mission_id in self.mission_state['mission_order']:
+        self._preempt_for_waiting_urgent_missions()
+
+        for mission_id in self._ordered_mission_ids():
             mission = self.mission_state['missions'][mission_id]
             if mission['status'] == 'pending_plan':
                 self._plan_mission(mission)
@@ -408,6 +500,30 @@ class SchedulerAgentNode(Node):
 
         self._publish_assignments()
         self._save_state()
+
+    def _ordered_mission_ids(self) -> list[str]:
+        def sort_key(mission_id: str) -> tuple[int, int]:
+            mission = self.mission_state['missions'][mission_id]
+            priority_rank = 0 if mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY else 1
+            order_index = self.mission_state['mission_order'].index(mission_id)
+            if priority_rank == 0:
+                order_index = -order_index
+            return priority_rank, order_index
+
+        return sorted(self.mission_state['mission_order'], key=sort_key)
+
+    def _preempt_for_waiting_urgent_missions(self) -> None:
+        for robot_name in self.robot_configs:
+            mission_id = self._latest_incomplete_urgent_mission_id(robot_name)
+            if mission_id is None:
+                continue
+            active_mission_id = self.robot_states[robot_name]['active_mission_id']
+            if self.robot_states[robot_name]['control_in_progress']:
+                continue
+            if active_mission_id is None or active_mission_id == mission_id:
+                continue
+            self._preempt_robot_for_urgent_mission(robot_name, mission_id)
+            return
 
     def _plan_mission(self, mission: dict) -> None:
         try:
@@ -420,13 +536,22 @@ class SchedulerAgentNode(Node):
 
         subtasks = []
         for index, subtask in enumerate(plan.get('subtasks', []), start=1):
+            if self._should_drop_unrequested_return_home_subtask(mission, subtask):
+                self._publish_feedback(
+                    f"Dropped unrequested return-to-spawn subtask from urgent mission {mission['mission_id']}."
+                )
+                continue
             subtasks.append(
                 {
                     'subtask_id': subtask.get('subtask_id') or f"{mission['mission_id']}_subtask_{index:03d}",
                     'instruction_text': subtask['instruction_text'],
                     'resume_context': subtask.get('resume_context', ''),
+                    'completion_criteria': self._normalize_text_list(subtask.get('completion_criteria', [])),
+                    'outcome_tags': self._normalize_tags(subtask.get('outcome_tags', [])),
                     'status': 'pending',
                     'last_message': '',
+                    'completed_outcome_tags': [],
+                    'completion_summary': '',
                 }
             )
 
@@ -442,12 +567,51 @@ class SchedulerAgentNode(Node):
         self.plan_publisher.publish(String(data=json.dumps({'mission_id': mission['mission_id'], 'plan': subtasks})))
         self._publish_feedback(f"Planned mission {mission['mission_id']} into {len(subtasks)} subtasks.")
 
+    def _should_drop_unrequested_return_home_subtask(self, mission: dict, subtask: dict) -> bool:
+        if mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY:
+            return False
+        if self._mission_explicitly_requests_return_home(mission.get('original_request', '')):
+            return False
+        text = ' '.join(
+            [
+                str(subtask.get('instruction_text', '')),
+                str(subtask.get('resume_context', '')),
+                ' '.join(self._normalize_text_list(subtask.get('completion_criteria', []))),
+                ' '.join(self._normalize_tags(subtask.get('outcome_tags', []))),
+            ]
+        ).lower()
+        return 'spawn' in text and any(token in text for token in ('return', 'home', 'returned'))
+
+    @staticmethod
+    def _mission_explicitly_requests_return_home(request_text: str) -> bool:
+        normalized = request_text.lower()
+        return (
+            'return to spawn' in normalized
+            or 'go to spawn' in normalized
+            or 'return home' in normalized
+            or 'go home' in normalized
+        )
+
     def _dispatch_next_subtask(self, mission: dict) -> None:
         robot_name = mission['assigned_robot']
         robot_state = self.robot_states[robot_name]
         if robot_state['active_subtask_id'] is not None:
             return
-        if mission['status'] == 'paused' and mission.get('pause_reason') not in AUTO_RESUME_PAUSE_REASONS:
+        if (
+            mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY
+            and self._robot_has_newer_incomplete_urgent_mission(robot_name, mission['mission_id'])
+        ):
+            return
+        if (
+            mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY
+            and self._robot_has_incomplete_urgent_mission(robot_name)
+        ):
+            return
+        if (
+            mission['status'] == 'paused'
+            and mission.get('pause_reason') not in AUTO_RESUME_PAUSE_REASONS
+            and not str(mission.get('pause_reason', '')).startswith('preempted_by_')
+        ):
             return
 
         for subtask in mission['subtasks']:
@@ -459,7 +623,9 @@ class SchedulerAgentNode(Node):
                     'robot_id': robot_name,
                     'instruction_text': subtask['instruction_text'],
                     'resume_context': subtask.get('resume_context', ''),
-                    'priority': 'normal',
+                    'completion_criteria': subtask.get('completion_criteria', []),
+                    'outcome_tags': subtask.get('outcome_tags', []),
+                    'priority': mission.get('priority', NORMAL_PRIORITY),
                     'dispatch_reason': dispatch_reason,
                 }
                 self.robot_task_publishers[robot_name].publish(String(data=json.dumps(envelope)))
@@ -476,15 +642,23 @@ class SchedulerAgentNode(Node):
         for robot_name, robot_state in self.robot_states.items():
             if robot_state['active_subtask_id'] is not None or robot_state['control_in_progress']:
                 continue
-            if self._robot_has_incomplete_urgent_mission(robot_name):
-                continue
-            for mission_id in self.mission_state['mission_order']:
+            for mission_id in self._ordered_mission_ids():
                 mission = self.mission_state['missions'][mission_id]
                 if mission.get('assigned_robot') != robot_name:
                     continue
                 if not str(mission.get('pause_reason', '')).startswith('preempted_by_'):
                     continue
                 if mission.get('status') != 'paused':
+                    continue
+                if (
+                    mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY
+                    and self._robot_has_newer_incomplete_urgent_mission(robot_name, mission_id)
+                ):
+                    continue
+                if (
+                    mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY
+                    and self._robot_has_incomplete_urgent_mission(robot_name)
+                ):
                     continue
                 mission['status'] = 'planned'
                 mission['pause_reason'] = ''
@@ -501,6 +675,44 @@ class SchedulerAgentNode(Node):
             if mission.get('status') != 'completed':
                 return True
         return False
+
+    def _latest_incomplete_urgent_mission_id(self, robot_name: str) -> str | None:
+        latest_mission_id = None
+        for mission_id in self.mission_state['mission_order']:
+            mission = self.mission_state['missions'][mission_id]
+            if mission.get('assigned_robot') != robot_name:
+                continue
+            if mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY:
+                continue
+            if mission.get('status') == 'completed':
+                continue
+            latest_mission_id = mission_id
+        return latest_mission_id
+
+    def _robot_has_newer_incomplete_urgent_mission(self, robot_name: str, mission_id: str) -> bool:
+        mission_index = self._mission_order_index(mission_id)
+        for candidate_id in self.mission_state['mission_order']:
+            mission = self.mission_state['missions'][candidate_id]
+            if mission.get('assigned_robot') != robot_name:
+                continue
+            if mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY:
+                continue
+            if mission.get('status') == 'completed':
+                continue
+            if self._mission_order_index(candidate_id) > mission_index:
+                return True
+        return False
+
+    def _mission_order_index(self, mission_id: str) -> int:
+        try:
+            return self.mission_state['mission_order'].index(mission_id)
+        except ValueError:
+            return -1
+
+    def _mission_started_before(self, candidate_id: str, reference_id: str) -> bool:
+        candidate_index = self._mission_order_index(candidate_id)
+        reference_index = self._mission_order_index(reference_id)
+        return candidate_index >= 0 and reference_index >= 0 and candidate_index < reference_index
 
     def _pause_active_work(self, reason: str) -> None:
         for robot_name, robot_state in self.robot_states.items():
@@ -529,6 +741,8 @@ class SchedulerAgentNode(Node):
             }
             self.robot_task_publishers[robot_name].publish(String(data=json.dumps(control_envelope)))
             robot_state['control_in_progress'] = True
+            robot_state['active_mission_id'] = mission_id
+            robot_state['active_subtask_id'] = control_envelope['subtask_id']
             self._publish_feedback(f"Paused {mission_id} on {robot_name}: {reason}")
         self._save_state()
 
@@ -559,7 +773,8 @@ class SchedulerAgentNode(Node):
             f"Mission request:\n{mission_request}\n\n"
             "Return only JSON with this shape:\n"
             '{'
-            '"subtasks":[{"subtask_id":"string","instruction_text":"string","resume_context":"string"}]'
+            '"subtasks":[{"subtask_id":"string","instruction_text":"string","resume_context":"string",'
+            '"completion_criteria":["string"],"outcome_tags":["string"]}]'
             '}\n'
             "Do not use markdown fences. Do not include comments. "
             "Keep the plan compact. For repeated patrols or long-duration work, "
@@ -599,7 +814,8 @@ class SchedulerAgentNode(Node):
             "Convert the following scheduler plan into valid JSON only.\n"
             "Preserve meaning, but fix syntax.\n"
             "Return exactly this shape:\n"
-            '{\"subtasks\":[{\"subtask_id\":\"string\",\"instruction_text\":\"string\",\"resume_context\":\"string\"}]}\n\n'
+            '{\"subtasks\":[{\"subtask_id\":\"string\",\"instruction_text\":\"string\",\"resume_context\":\"string\",'
+            '\"completion_criteria\":[\"string\"],\"outcome_tags\":[\"string\"]}]}\n\n'
             f"Parser error:\n{parse_error}\n\n"
             f"Invalid content:\n{raw_text}"
         )
@@ -639,13 +855,10 @@ class SchedulerAgentNode(Node):
         if self.weather_snapshot is None:
             return False, 'weather_api_unavailable'
 
-        now = datetime.now(ZoneInfo(self.scheduler_config['site']['timezone']))
-        sunrise = datetime.fromisoformat(self.weather_snapshot['sunrise']).astimezone(
-            ZoneInfo(self.scheduler_config['site']['timezone'])
-        )
-        sunset = datetime.fromisoformat(self.weather_snapshot['sunset']).astimezone(
-            ZoneInfo(self.scheduler_config['site']['timezone'])
-        )
+        site_timezone = ZoneInfo(self.scheduler_config['site']['timezone'])
+        now = datetime.now(site_timezone)
+        sunrise = self._parse_site_datetime(self.weather_snapshot['sunrise'], site_timezone)
+        sunset = self._parse_site_datetime(self.weather_snapshot['sunset'], site_timezone)
         if now < sunrise:
             return False, 'before_sunrise'
         if now >= sunset:
@@ -653,6 +866,24 @@ class SchedulerAgentNode(Node):
         if self.weather_snapshot['blocking_reason']:
             return False, self.weather_snapshot['blocking_reason']
         return True, ''
+
+    @staticmethod
+    def _parse_site_datetime(value: str, site_timezone: ZoneInfo) -> datetime:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=site_timezone)
+        return parsed.astimezone(site_timezone)
+
+    def _publish_blocked_if_needed(self, reason: str) -> None:
+        if reason == self.last_scheduler_block_reason:
+            return
+        has_open_missions = any(
+            self.mission_state['missions'][mission_id].get('status') != 'completed'
+            for mission_id in self.mission_state['mission_order']
+        )
+        if has_open_missions:
+            self._publish_feedback(f'Scheduler is not planning because work is currently blocked: {reason}.')
+        self.last_scheduler_block_reason = reason
 
     def _refresh_weather(self) -> None:
         site_config = self.scheduler_config['site']
@@ -696,6 +927,110 @@ class SchedulerAgentNode(Node):
         for name, location in sorted(locations.items()):
             lines.append(f'- {name}: x={location["x"]}, y={location["y"]}, yaw={location.get("yaw", 0.0)}')
         return '\n'.join(lines)
+
+    def _apply_completed_outcomes_to_pending_work(self, completed_mission: dict) -> None:
+        completed_subtasks = [
+            subtask
+            for subtask in completed_mission.get('subtasks', [])
+            if subtask.get('status') == 'completed' and subtask.get('completed_outcome_tags')
+        ]
+        if not completed_subtasks:
+            return
+
+        for completed_subtask in completed_subtasks:
+            completed_tags = self._normalize_tags(completed_subtask.get('completed_outcome_tags', []))
+            if not completed_tags:
+                continue
+            for mission_id in self.mission_state['mission_order']:
+                mission = self.mission_state['missions'][mission_id]
+                if not self._eligible_for_urgent_outcome_satisfaction(mission, completed_mission):
+                    continue
+                for pending_subtask in mission.get('subtasks', []):
+                    if pending_subtask.get('status') not in {'pending', 'paused'}:
+                        continue
+                    if self._completed_outcome_satisfies_subtask(completed_subtask, pending_subtask):
+                        pending_subtask['status'] = 'completed'
+                        pending_subtask['completed_outcome_tags'] = completed_tags
+                        pending_subtask['completion_summary'] = (
+                            f"Satisfied by urgent mission {completed_mission['mission_id']} "
+                            f"subtask {completed_subtask.get('subtask_id', '')}."
+                        )
+                        pending_subtask['last_message'] = pending_subtask['completion_summary']
+                        self._publish_feedback(
+                            f"Marked {mission_id}/{pending_subtask.get('subtask_id', '')} complete because "
+                            f"urgent mission {completed_mission['mission_id']} satisfied the same outcome."
+                        )
+
+                if mission.get('subtasks') and all(
+                    subtask.get('status') == 'completed' for subtask in mission.get('subtasks', [])
+                ):
+                    mission['status'] = 'completed'
+                    mission['pause_reason'] = ''
+
+    def _eligible_for_urgent_outcome_satisfaction(self, candidate_mission: dict, completed_mission: dict) -> bool:
+        candidate_id = candidate_mission.get('mission_id', '')
+        completed_id = completed_mission.get('mission_id', '')
+        if candidate_id == completed_id:
+            return False
+        if completed_mission.get('priority', NORMAL_PRIORITY) != URGENT_PRIORITY:
+            return False
+        if candidate_mission.get('assigned_robot') != completed_mission.get('assigned_robot'):
+            return False
+        if candidate_mission.get('priority', NORMAL_PRIORITY) == URGENT_PRIORITY:
+            return False
+        if candidate_mission.get('status') == 'completed':
+            return False
+        return self._mission_started_before(candidate_id, completed_id)
+
+    def _completed_outcome_satisfies_subtask(self, completed_subtask: dict, pending_subtask: dict) -> bool:
+        completed_tags = set(self._normalize_tags(completed_subtask.get('completed_outcome_tags', [])))
+        required_tags = set(self._normalize_tags(pending_subtask.get('outcome_tags', [])))
+        if completed_tags and required_tags and required_tags.issubset(completed_tags):
+            return True
+        return self._verify_outcome_match_with_bedrock(completed_subtask, pending_subtask)
+
+    def _verify_outcome_match_with_bedrock(self, completed_subtask: dict, pending_subtask: dict) -> bool:
+        try:
+            prompt = (
+                "Decide whether a completed urgent robot task satisfies a pending scheduled subtask.\n"
+                "Be conservative. Do not match based on location alone. Match only when the same concrete "
+                "outcome/action/object/location is completed.\n"
+                "For simple room patrol work, visiting/checking/inspecting the same area can satisfy another "
+                "passive visit/check/inspect subtask. For manipulation, retrieval, delivery, or object tasks, "
+                "match only if the same action, object, source, and destination are satisfied.\n"
+                "Return JSON only with this exact shape: {\"satisfies\":true,\"reason\":\"string\"}\n\n"
+                f"Completed urgent subtask:\n{json.dumps(completed_subtask)}\n\n"
+                f"Pending subtask:\n{json.dumps(pending_subtask)}"
+            )
+            response = self._parse_json_response(
+                self._converse_text([{'role': 'user', 'content': [{'text': prompt}]}])
+            )
+        except Exception as exc:
+            self._publish_feedback(f'Outcome verifier could not compare subtasks safely: {exc}')
+            return False
+
+        satisfies = bool(response.get('satisfies', False))
+        reason = str(response.get('reason', '')).strip()
+        if satisfies:
+            self._publish_feedback(f'Outcome verifier approved subtask skip: {reason}')
+        return satisfies
+
+    @staticmethod
+    def _normalize_tags(tags: Any) -> list[str]:
+        if not isinstance(tags, list):
+            return []
+        normalized = []
+        for tag in tags:
+            value = str(tag).strip().lower().replace(' ', '_')
+            if value:
+                normalized.append(value)
+        return sorted(set(normalized))
+
+    @staticmethod
+    def _normalize_text_list(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        return [str(value).strip() for value in values if str(value).strip()]
 
     def _publish_status(self) -> None:
         snapshot = {

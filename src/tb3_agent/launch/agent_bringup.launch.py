@@ -47,4 +47,18 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{'use_sim_time': True}],
     )
 
-    return LaunchDescription([bringup, robot_agent_stack, scheduler])
+    scheduler_ui = Node(
+        package='tb3_agent',
+        executable='scheduler_ui_node',
+        name='scheduler_ui_node',
+        output='screen',
+        parameters=[
+            {
+                'use_sim_time': True,
+                'host': '127.0.0.1',
+                'port': 8080,
+            }
+        ],
+    )
+
+    return LaunchDescription([bringup, robot_agent_stack, scheduler, scheduler_ui])

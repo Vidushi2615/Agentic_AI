@@ -35,6 +35,7 @@ setup(
             'command_executor_node = tb3_agent.command_executor_node:main',
             'task_agent_node = tb3_agent.task_agent_node:main',
             'scheduler_agent_node = tb3_agent.scheduler_agent_node:main',
+            'scheduler_ui_node = tb3_agent.scheduler_ui_node:main',
         ],
     },
 )

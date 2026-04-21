@@ -49,6 +49,32 @@ with the local map `/home/vidushi/ros2_ws/maps/map_house.yaml`
 and opens the house navigation RViz debug view. It launches:
 - a namespaced robot stack under `/robot_1`
 - the fleet scheduler agent in the global namespace
+- a local scheduler web console at `http://127.0.0.1:8080`
+
+## Scheduler web console
+
+Open this in a browser after `agent_bringup` starts:
+
+```bash
+http://127.0.0.1:8080
+```
+
+Use the console to talk to the scheduler instead of publishing terminal
+commands manually. It sends messages to `/scheduler/mission_requests`.
+
+The first tab is a conversation view between you and the scheduler. The other
+tabs monitor:
+- scheduler feedback
+- scheduler status
+- mission plan
+- active assignments
+- robot agent feedback
+- robot agent status
+- scheduled task results
+- robot agent commands
+
+If the scheduler or robot agent needs clarification, the console shows an
+alert above the tabs.
 
 ## Operator task topic
 

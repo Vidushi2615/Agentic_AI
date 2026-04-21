@@ -78,6 +78,20 @@ class TaskAgentNode(Node):
             self._publish_feedback(f'Invalid scheduled task envelope: {exc}')
             return
 
+        dispatch_reason = str(envelope.get('dispatch_reason', '')).strip()
+        if (
+            self.active_scheduled_task is not None
+            and self.awaiting_scheduled_execution_result
+            and dispatch_reason not in {'stop_work', 'return_home'}
+        ):
+            message = (
+                'Robot task agent is already waiting for the current scheduled task to finish; '
+                'rejected overlapping scheduled task.'
+            )
+            self._publish_feedback(message)
+            self._publish_scheduled_result_for_envelope(envelope, 'blocked', message)
+            return
+
         self.active_scheduled_task = envelope
         self.awaiting_scheduled_execution_result = False
         self.awaiting_scheduled_execution_mode = None
@@ -89,7 +103,9 @@ class TaskAgentNode(Node):
             f"Mission id: {envelope.get('mission_id', '')}\n"
             f"Subtask id: {envelope.get('subtask_id', '')}\n"
             f"Dispatch reason: {envelope.get('dispatch_reason', '')}\n"
-            f"Resume context: {envelope.get('resume_context', '')}"
+            f"Resume context: {envelope.get('resume_context', '')}\n"
+            f"Completion criteria: {json.dumps(envelope.get('completion_criteria', []))}\n"
+            f"Expected outcome tags: {json.dumps(envelope.get('outcome_tags', []))}"
         )
         self._run_task(envelope.get('instruction_text', '').strip(), extra_context=extra_context)
 
@@ -118,6 +134,15 @@ class TaskAgentNode(Node):
                 task_id = self.active_scheduled_task.get('subtask_id', '')
                 self._publish_feedback(
                     f'Scheduled task {task_id} was sent to the executor. Waiting for navigation result.'
+                )
+                return
+
+            if self._status_indicates_navigation_active(self.current_status):
+                self.awaiting_scheduled_execution_result = True
+                self.awaiting_scheduled_execution_mode = 'navigation'
+                task_id = self.active_scheduled_task.get('subtask_id', '')
+                self._publish_feedback(
+                    f'Scheduled task {task_id} is associated with active navigation. Waiting for navigation result.'
                 )
                 return
 
@@ -234,18 +259,23 @@ class TaskAgentNode(Node):
     def _publish_scheduled_result(self, status: str, message: str) -> None:
         if self.active_scheduled_task is None:
             return
-        result = {
-            'mission_id': self.active_scheduled_task.get('mission_id', ''),
-            'subtask_id': self.active_scheduled_task.get('subtask_id', ''),
-            'robot_id': self.active_scheduled_task.get('robot_id', self.get_namespace().strip('/')),
-            'status': status,
-            'message': message,
-        }
-        self.scheduled_result_publisher.publish(String(data=json.dumps(result)))
+        self._publish_scheduled_result_for_envelope(self.active_scheduled_task, status, message)
         if status in {'completed', 'failed', 'cancelled', 'needs_clarification'}:
             self.active_scheduled_task = None
             self.awaiting_scheduled_execution_result = False
             self.awaiting_scheduled_execution_mode = None
+
+    def _publish_scheduled_result_for_envelope(self, envelope: dict, status: str, message: str) -> None:
+        result = {
+            'mission_id': envelope.get('mission_id', ''),
+            'subtask_id': envelope.get('subtask_id', ''),
+            'robot_id': envelope.get('robot_id', self.get_namespace().strip('/')),
+            'status': status,
+            'message': message,
+            'completed_outcome_tags': self._completed_outcome_tags(status, envelope),
+            'completion_summary': self._completion_summary(status, message, envelope),
+        }
+        self.scheduled_result_publisher.publish(String(data=json.dumps(result)))
 
     @staticmethod
     def _has_execution_tool(executed_tools: list[dict]) -> bool:
@@ -267,6 +297,31 @@ class TaskAgentNode(Node):
         if tool_names == {'cancel_navigation'}:
             return 'cancel_only'
         return 'navigation'
+
+    @staticmethod
+    def _status_indicates_navigation_active(status: str) -> bool:
+        normalized = status.strip().lower()
+        return normalized in {
+            'goal accepted',
+            'goal sent to nav2',
+            'goal active',
+        } or normalized.startswith('queued ')
+
+    @staticmethod
+    def _completed_outcome_tags(status: str, envelope: dict) -> list[str]:
+        if status != 'completed':
+            return []
+        tags = envelope.get('outcome_tags', [])
+        if not isinstance(tags, list):
+            return []
+        return [str(tag).strip() for tag in tags if str(tag).strip()]
+
+    @staticmethod
+    def _completion_summary(status: str, message: str, envelope: dict) -> str:
+        instruction = envelope.get('instruction_text', '')
+        if status == 'completed':
+            return f'Completed scheduled instruction: {instruction}. Executor result: {message}'
+        return f'Scheduled instruction did not complete: {instruction}. Executor result: {message}'
 
     @staticmethod
     def _build_tool_config() -> list[dict]:

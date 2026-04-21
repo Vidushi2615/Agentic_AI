@@ -1,7 +1,7 @@
 site:
-  latitude: 37.7749
-  longitude: -122.4194
-  timezone: America/Los_Angeles
+  latitude: 55.9533
+  longitude: -3.1883
+  timezone: Europe/London
 
 region: eu-west-2
 weather_poll_seconds: 300

@@ -21,7 +21,8 @@ ros2 launch tb3_bringup house_nav_bringup.launch.py
 
 The launch file starts Gazebo, Nav2, RViz, and publishes `/initialpose` once for AMCL.
 It uses the local house map at `/home/vidushi/ros2_ws/maps/map_house.yaml`
-and the installed TurtleBot3 Nav2 parameter file `turtlebot3_navigation2/param/humble/burger.yaml`.
+and the documented TurtleBot3 Nav2 parameter file installed at
+`/opt/ros/humble/share/turtlebot3_navigation2/param/humble/burger.yaml`.
 
 The RViz debug view shows:
 - `/map`
